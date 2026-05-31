@@ -14,7 +14,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const HERMES_HOME = path.join(os_homedir(), ".hermes");
+const HERMES_HOME = process.env.HERMES_HOME || path.join(os_homedir(), ".hermes");
 const HERMES_PLUGINS = path.join(HERMES_HOME, "plugins");
 const HERMES_SCRIPTS = path.join(HERMES_HOME, "scripts");
 
