@@ -24,6 +24,8 @@ REVERT_WRAPPER = os.path.join(SCRIPT_DIR, "revert-model.py")
 JOBS_PATH = os.path.join(HERMES_HOME, "cron", "jobs.json")
 CONFIG_PATH = os.path.join(HERMES_HOME, "config.yaml")
 CRON_NAME = "revert-free-model"
+SNAPSHOT_DIR = os.path.join(HERMES_HOME, "model-snapshots")
+WIZARD_STATE_PATH = os.path.join(SNAPSHOT_DIR, "wizard-state.json")
 
 # Populated by _ensure_revert_cron() at registration time.
 _revert_cron_id: Optional[str] = None
@@ -213,106 +215,196 @@ if result.returncode:
 
 
 # ---------------------------------------------------------------------------
-# Handlers
+# Wizard state machine
 # ---------------------------------------------------------------------------
 
-def _prompt(question: str, default: str = "") -> str:
-    """Prompt user via terminal with styled question."""
-    sys.stdout.write(f"\n  {question} ")
-    sys.stdout.flush()
+WIZARD_SCHEMA = {
+    "model": "1/3: Which model? (e.g., stepfun/step-3.7-flash:free)",
+    "provider": "2/3: Which provider? (nous, openrouter, deepseek, ...) [default]",
+    "scope": "3/3: Scope? (full / gateway-only) [full]",
+    "confirm": None,  # handled specially
+}
+
+
+def _wizard_state() -> dict | None:
+    """Read current wizard state, or None if no wizard is active."""
+    if not os.path.exists(WIZARD_STATE_PATH):
+        return None
     try:
-        ans = sys.stdin.readline().strip()
-    except (EOFError, KeyboardInterrupt):
-        return default if default else ""
-    if not ans and default:
-        return default
-    return ans
+        with open(WIZARD_STATE_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
-def _wizard() -> str:
-    """Interactive wizard for /free-model with no arguments in CLI mode."""
-    lines: list[str] = []
-    lines.append("")
-    lines.append("  ┌─ Free Model Switch ─────────────────────────────┐")
+def _wizard_save(state: dict) -> None:
+    """Persist wizard state."""
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    with open(WIZARD_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2, default=str)
 
-    # Step 1: Model
-    lines.append("  │                                                  │")
-    default_provider = _get_current_provider()
-    while True:
-        ans = _prompt("Model (e.g. stepfun/step-3.7-flash:free):")
-        if not ans:
-            continue
-        err = _validate_model(ans)
+
+def _wizard_clear() -> None:
+    """Remove wizard state."""
+    try:
+        os.remove(WIZARD_STATE_PATH)
+    except OSError:
+        pass
+
+
+def _wizard_start() -> str:
+    """Initialize a new wizard and return the first question."""
+    state = {
+        "created_at": datetime.now().isoformat(),
+        "step": "model",
+        "model": None,
+        "provider": None,
+        "scope": None,
+    }
+    _wizard_save(state)
+    return (
+        "\n"
+        "  ┌─ Free Model Switch ─────────────────────────────┐\n"
+        "  │                                                  │\n"
+        f"  │  {WIZARD_SCHEMA['model'].ljust(49)}│\n"
+        "  │                                                  │\n"
+        "  └──────────────────────────────────────────────────┘\n"
+        "\n"
+        f"Type:  /free-model <answer>"
+    )
+
+
+def _wizard_advance(state: dict, answer: str) -> str:
+    """Apply the user's answer to the current step and advance to the next.
+
+    Returns the next question or the execution result on completion.
+    """
+    step = state["step"]
+
+    if step == "model":
+        err = _validate_model(answer)
         if err:
-            lines.append(f"  │  ✗ {ans} — {err}")
-            continue
-        model = ans
-        break
+            return f"Invalid model: {err}\nType /free-model with a valid model name."
+        state["model"] = answer
+        default_provider = _get_current_provider() or "openrouter"
+        state["provider"] = default_provider  # default until user overrides
+        state["step"] = "provider"
+        _wizard_save(state)
+        return (
+            f"  ✓ Model: {answer}\n\n"
+            f"  {WIZARD_SCHEMA['provider']}\n"
+            f"     (Enter for default: {default_provider})"
+        )
 
-    # Step 2: Provider
-    prov_default = default_provider or "openrouter"
-    ans = _prompt(f"Provider [{prov_default}]:", default=prov_default)
-    provider = ans if ans else prov_default
+    elif step == "provider":
+        if answer:
+            state["provider"] = answer
+        state["step"] = "scope"
+        _wizard_save(state)
+        return (
+            f"  ✓ Provider: {state['provider']}\n\n"
+            f"  {WIZARD_SCHEMA['scope']}"
+        )
 
-    # Step 3: Scope
-    ans = _prompt("Scope: full (all surfaces) or gateway-only [full]:", default="full")
-    gateway_only = ans.strip().lower() in ("gateway-only", "gateway", "g")
+    elif step == "scope":
+        scope = answer.strip().lower()
+        if scope in ("gateway-only", "gateway", "g"):
+            state["scope"] = "gateway-only"
+        else:
+            state["scope"] = "full"
+        state["step"] = "confirm"
+        _wizard_save(state)
+        model = state["model"]
+        provider = state["provider"]
+        scope_label = state["scope"]
+        return (
+            "  ┌─ Free Model Switch ─────────────────────────────┐\n"
+            f"  │  ✓ Model:    {model.ljust(38)}│\n"
+            f"  │  ✓ Provider: {provider.ljust(38)}│\n"
+            f"  │  ✓ Scope:    {scope_label.ljust(38)}│\n"
+            "  │                                                  │\n"
+            "  │  Apply? (yes/no) [yes]                             │\n"
+            "  └──────────────────────────────────────────────────┘\n"
+            "\n"
+            "Type:  /free-model yes   — to apply\n"
+            "       /free-model no    — to cancel"
+        )
 
-    # Step 4: Confirm
-    lines.append("  │  ✓ Model:    " + model.ljust(38) + "│")
-    lines.append("  │  ✓ Provider: " + provider.ljust(38) + "│")
-    lines.append("  │  ✓ Scope:    " + ("gateway-only" if gateway_only else "full").ljust(38) + "│")
-    lines.append("  │                                                  │")
-    confirm = _prompt("Apply? [Y/n]:", default="y")
-    if confirm.lower() not in ("y", "", "yes"):
-        lines.append("  │  ✗ Cancelled.")
-        lines.append("  └──────────────────────────────────────────────────┘")
-        lines.append("")
-        return "\n".join(lines)
+    elif step == "confirm":
+        if answer.lower() in ("y", "yes", ""):
+            return _wizard_execute(state)
+        else:
+            _wizard_clear()
+            return "Cancelled."
 
-    lines.append("  │  Applying...                                     │")
-    lines.append("  └──────────────────────────────────────────────────┘")
-    lines.append("")
-    sys.stdout.write("\n".join(lines))
-    sys.stdout.flush()
+    return "Wizard step not recognized. Start over: /free-model"
 
-    # Execute
+
+def _wizard_execute(state: dict) -> str:
+    """Execute the switch from wizard state and clean up."""
+    model = state["model"]
+    provider = state["provider"]
+    gateway_only = state["scope"] == "gateway-only"
+
     set_model_args = ["--model", model, "--provider", provider]
     if gateway_only:
         set_model_args.extend(["--skip-delegation", "--skip-cron"])
 
+    _wizard_clear()
     output = _run_set_model(set_model_args)
-    return "\n" + output
+    return "✓ Applied.\n\n" + output
 
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
 
 def _handle_free_model(raw_args: str) -> Optional[str]:
     args = raw_args.strip()
-    if not args:
-        # Interactive wizard in TTY mode, help text in gateway/TUI mode
-        if sys.stdin.isatty():
-            return _wizard()
+
+    # --- Active wizard: advance with user's answer ---
+    wizard = _wizard_state()
+    if wizard and args:
+        return _wizard_advance(wizard, args)
+
+    # --- Active wizard, no args: show progress ---
+    if wizard and not args:
+        step = wizard["step"]
+        model = wizard.get("model") or "—"
+        provider = wizard.get("provider") or "—"
+        scope = wizard.get("scope") or "—"
         return (
-            "Usage: /free-model <model> [--provider <name>] [--gateway-only]\n\n"
-            "Examples:\n"
-            "  /free-model stepfun/step-3.7-flash:free\n"
-            "  /free-model deepseek/deepseek-v4-flash:free --provider deepseek\n"
-            "  /free-model stepfun/step-3.7-flash:free --gateway-only\n"
-            "  /free-model arcee-ai/trinity-mini:free --provider openrouter\n\n"
-            "Omitting --provider uses your currently configured default provider.\n"
-            "Use --gateway-only to skip delegation model and cron jobs.\n"
-            "Switches config.yaml (model.default + delegation.model)\n"
-            "and all LLM-driven cron jobs to the given model/provider."
+            "\n"
+            "  ┌─ Free Model Switch (in progress) ───────────────┐\n"
+            f"  │  Model:    {model.ljust(39)}│\n"
+            f"  │  Provider: {provider.ljust(39)}│\n"
+            f"  │  Scope:    {scope.ljust(39)}│\n"
+            "  │                                                  │\n"
+            f"  │  {WIZARD_SCHEMA.get(step, 'Done.').ljust(49)}│\n"
+            "  │                                                  │\n"
+            "  └──────────────────────────────────────────────────┘\n"
+            "\n"
+            "Type:  /free-model <answer>     — to provide the info above\n"
+            "       /free-model cancel       — to cancel the wizard"
         )
 
+    # --- No active wizard, no args: start wizard ---
+    if not args:
+        return _wizard_start()
+
+    # --- No active wizard, with args: handle as cancel or one-shot ---
+    if args.lower().strip() == "cancel":
+        _wizard_clear()
+        return "Cancelled."
+
+    # --- One-shot command (existing behavior) ---
     parts = args.split()
     model = parts[0]
 
-    # Validate model string
     err = _validate_model(model)
     if err:
         return f"Invalid model: {err}"
 
-    # Parse optional flags from remaining args
     flags = parts[1:]
     provider: Optional[str] = None
     gateway_only = False
@@ -340,8 +432,7 @@ def _handle_free_model(raw_args: str) -> Optional[str]:
     if gateway_only:
         set_model_args.extend(["--skip-delegation", "--skip-cron"])
 
-    output = _run_set_model(set_model_args)
-    return output
+    return _run_set_model(set_model_args)
 
 
 def _handle_free_model_end(raw_args: str) -> Optional[str]:
