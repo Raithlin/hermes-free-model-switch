@@ -1,0 +1,33 @@
+{
+  "name": "hermes-free-model-switch",
+  "version": "1.0.0",
+  "description": "Hermes plugin — /free-model and /free-model-end slash commands for switching to temporarily free LLM models",
+  "license": "MIT",
+  "author": "Stephen <raithlin@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Raithlin/hermes-free-model-switch"
+  },
+  "keywords": [
+    "hermes",
+    "hermes-plugin",
+    "free-model",
+    "llm",
+    "openrouter",
+    "cost-saving"
+  ],
+  "bin": {
+    "hermes-free-model-switch": "./bin/hermes-free-model-switch.js"
+  },
+  "files": [
+    "bin/",
+    "plugins/",
+    "scripts/",
+    "README.md",
+    "LICENSE",
+    "after-install.md"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

@@ -1,0 +1,7 @@
+name: free-model
+version: 1.0.0
+description: "Slash commands /free-model and /free-model-end for switching to temporarily free models"
+author: Stephen
+requires_env: []
+provides_tools: []
+provides_hooks: []
