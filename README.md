@@ -90,6 +90,21 @@ automatically rolls back from the snapshot.
 
 The plugin respects `$HERMES_HOME` if set, falling back to `~/.hermes` otherwise.
 
+## Platform support
+
+| Platform | Status |
+|----------|--------|
+| Linux    | Primary target. Fully tested. |
+| macOS    | Should work — same POSIX semantics. Not regularly tested. |
+| Windows  | Compatible in principle (no platform-specific deps) but untested. |
+
+Known caveats on non-Linux:
+- Running `set-model.py` directly from a terminal requires `python3` on PATH (ignores shebangs on Windows — use `py` instead).
+- `chmod` calls are no-ops on Windows (harmless).
+- The installer, revert wrapper, and `hermes cron` calls all shell out to the `hermes` CLI — that binary must be on PATH for your platform.
+
+If you test on macOS or Windows, please report issues.
+
 ## License
 
 MIT
