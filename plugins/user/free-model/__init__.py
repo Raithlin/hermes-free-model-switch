@@ -216,9 +216,81 @@ if result.returncode:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _prompt(question: str, default: str = "") -> str:
+    """Prompt user via terminal with styled question."""
+    sys.stdout.write(f"\n  {question} ")
+    sys.stdout.flush()
+    try:
+        ans = sys.stdin.readline().strip()
+    except (EOFError, KeyboardInterrupt):
+        return default if default else ""
+    if not ans and default:
+        return default
+    return ans
+
+
+def _wizard() -> str:
+    """Interactive wizard for /free-model with no arguments in CLI mode."""
+    lines: list[str] = []
+    lines.append("")
+    lines.append("  ┌─ Free Model Switch ─────────────────────────────┐")
+
+    # Step 1: Model
+    lines.append("  │                                                  │")
+    default_provider = _get_current_provider()
+    while True:
+        ans = _prompt("Model (e.g. stepfun/step-3.7-flash:free):")
+        if not ans:
+            continue
+        err = _validate_model(ans)
+        if err:
+            lines.append(f"  │  ✗ {ans} — {err}")
+            continue
+        model = ans
+        break
+
+    # Step 2: Provider
+    prov_default = default_provider or "openrouter"
+    ans = _prompt(f"Provider [{prov_default}]:", default=prov_default)
+    provider = ans if ans else prov_default
+
+    # Step 3: Scope
+    ans = _prompt("Scope: full (all surfaces) or gateway-only [full]:", default="full")
+    gateway_only = ans.strip().lower() in ("gateway-only", "gateway", "g")
+
+    # Step 4: Confirm
+    lines.append("  │  ✓ Model:    " + model.ljust(38) + "│")
+    lines.append("  │  ✓ Provider: " + provider.ljust(38) + "│")
+    lines.append("  │  ✓ Scope:    " + ("gateway-only" if gateway_only else "full").ljust(38) + "│")
+    lines.append("  │                                                  │")
+    confirm = _prompt("Apply? [Y/n]:", default="y")
+    if confirm.lower() not in ("y", "", "yes"):
+        lines.append("  │  ✗ Cancelled.")
+        lines.append("  └──────────────────────────────────────────────────┘")
+        lines.append("")
+        return "\n".join(lines)
+
+    lines.append("  │  Applying...                                     │")
+    lines.append("  └──────────────────────────────────────────────────┘")
+    lines.append("")
+    sys.stdout.write("\n".join(lines))
+    sys.stdout.flush()
+
+    # Execute
+    set_model_args = ["--model", model, "--provider", provider]
+    if gateway_only:
+        set_model_args.extend(["--skip-delegation", "--skip-cron"])
+
+    output = _run_set_model(set_model_args)
+    return "\n" + output
+
+
 def _handle_free_model(raw_args: str) -> Optional[str]:
     args = raw_args.strip()
     if not args:
+        # Interactive wizard in TTY mode, help text in gateway/TUI mode
+        if sys.stdin.isatty():
+            return _wizard()
         return (
             "Usage: /free-model <model> [--provider <name>] [--gateway-only]\n\n"
             "Examples:\n"
