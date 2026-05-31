@@ -17,7 +17,9 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+from hermes_constants import get_hermes_home
+
+HERMES_HOME = get_hermes_home()
 SCRIPT_DIR = os.path.join(HERMES_HOME, "scripts")
 SET_MODEL_SCRIPT = os.path.join(SCRIPT_DIR, "set-model.py")
 REVERT_WRAPPER = os.path.join(SCRIPT_DIR, "revert-model.py")
@@ -112,7 +114,7 @@ def _ensure_revert_cron() -> None:
 def _find_cron_by_name(name: str) -> Optional[dict]:
     """Return the cron job dict for the given name, or None."""
     try:
-        with open(JOBS_PATH) as f:
+        with open(JOBS_PATH, encoding="utf-8") as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
@@ -234,7 +236,7 @@ def _wizard_state() -> dict | None:
     if not os.path.exists(WIZARD_STATE_PATH):
         return None
     try:
-        with open(WIZARD_STATE_PATH) as f:
+        with open(WIZARD_STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
@@ -243,7 +245,7 @@ def _wizard_state() -> dict | None:
 def _wizard_save(state: dict) -> None:
     """Persist wizard state."""
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-    with open(WIZARD_STATE_PATH, "w") as f:
+    with open(WIZARD_STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, default=str)
 
 

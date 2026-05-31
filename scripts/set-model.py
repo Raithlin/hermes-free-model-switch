@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+HERMES_HOME = os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
 CONFIG_PATH = os.path.join(HERMES_HOME, "config.yaml")
 JOBS_PATH = os.path.join(HERMES_HOME, "cron", "jobs.json")
 SNAPSHOT_DIR = os.path.join(HERMES_HOME, "model-snapshots")
@@ -39,17 +39,17 @@ REVERT_STACK_SIZE = 5
 # ---------------------------------------------------------------------------
 
 def load_yaml(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
 def write_yaml(path, data):
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
 
 def load_json(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
