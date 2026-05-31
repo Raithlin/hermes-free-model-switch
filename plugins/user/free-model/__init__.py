@@ -10,21 +10,24 @@ import json
 import os
 import subprocess
 import sys
+import yaml
 from datetime import datetime
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Constants
+# Paths
 # ---------------------------------------------------------------------------
-SCRIPT_DIR = os.path.expanduser("~/.hermes/scripts")
+HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+SCRIPT_DIR = os.path.join(HERMES_HOME, "scripts")
 SET_MODEL_SCRIPT = os.path.join(SCRIPT_DIR, "set-model.py")
 REVERT_WRAPPER = os.path.join(SCRIPT_DIR, "revert-model.py")
-JOBS_PATH = os.path.expanduser("~/.hermes/cron/jobs.json")
+JOBS_PATH = os.path.join(HERMES_HOME, "cron", "jobs.json")
+CONFIG_PATH = os.path.join(HERMES_HOME, "config.yaml")
 CRON_NAME = "revert-free-model"
-DEFAULT_PROVIDER = "openrouter"
 
 # Populated by _ensure_revert_cron() at registration time.
 _revert_cron_id: Optional[str] = None
+_cron_setup_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +54,10 @@ def _ensure_revert_cron() -> None:
     """Create the revert cron job if missing, then ensure it's paused.
 
     Idempotent — safe to call on every plugin load.
+    Sets _cron_setup_error on failure so handlers can report it.
     """
-    global _revert_cron_id
+    global _revert_cron_id, _cron_setup_error
+    _cron_setup_error = None
 
     # Ensure the revert wrapper script exists
     _create_revert_wrapper()
@@ -77,10 +82,9 @@ def _ensure_revert_cron() -> None:
     )
 
     if result.returncode:
-        # Non-fatal — log but don't crash plugin load.
         msg = (result.stderr or result.stdout or "unknown error").strip()
-        print(f"[free-model plugin] WARNING: could not create revert cron: {msg}",
-              file=sys.stderr)
+        _cron_setup_error = f"Could not create revert cron: {msg}"
+        print(f"[free-model plugin] ERROR: {_cron_setup_error}", file=sys.stderr)
         return
 
     # Find ID from the created job
@@ -125,6 +129,38 @@ def _update_cron_schedule(job_id: str, iso: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _validate_model(model: str) -> Optional[str]:
+    """Basic sanity check on model string. Returns error or None."""
+    if not model:
+        return "Model name is required."
+    if " " in model:
+        return "Model name must not contain spaces."
+    if "/" not in model:
+        return "Model should include provider prefix (e.g., org/model)."
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Provider resolution
+# ---------------------------------------------------------------------------
+
+def _get_current_provider() -> Optional[str]:
+    """Read the current model.provider from config.yaml.
+
+    Fallback: None means caller should raise or error.
+    """
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = yaml.safe_load(f) or {}
+        return (cfg.get("model", {}) or {}).get("provider")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Script helpers
 # ---------------------------------------------------------------------------
 
@@ -139,7 +175,7 @@ def _run_set_model(args: list[str]) -> str:
         return (
             "Error: set-model.py not found at:\n"
             f"  {SET_MODEL_SCRIPT}\n"
-            "Run the model-switch skill setup first."
+            "Run the plugin install/update first."
         )
     except subprocess.TimeoutExpired:
         return "Error: set-model.py timed out after 30 seconds."
@@ -156,6 +192,7 @@ def _create_revert_wrapper() -> None:
     """Create revert-model.py wrapper script if missing."""
     if os.path.exists(REVERT_WRAPPER):
         return
+    os.makedirs(SCRIPT_DIR, exist_ok=True)
     wrapper = '''#!/usr/bin/env python3
 """Wrapper that reverts model config — invoked by revert-free-model cron job."""
 import os, subprocess, sys
@@ -185,18 +222,33 @@ def _handle_free_model(raw_args: str) -> Optional[str]:
         return (
             "Usage: /free-model <model> [--provider <name>]\n\n"
             "Examples:\n"
-            "  /free-model deepseek/deepseek-v4-flash:free\n"
+            "  /free-model stepfun/step-3.7-flash:free\n"
+            "  /free-model deepseek/deepseek-v4-flash:free --provider deepseek\n"
             "  /free-model arcee-ai/trinity-mini:free --provider openrouter\n\n"
+            "Omitting --provider uses your currently configured default provider.\n"
             "Switches config.yaml (model.default + delegation.model)\n"
-            "and all LLM-driven cron jobs to the given model."
+            "and all LLM-driven cron jobs to the given model/provider."
         )
 
     parts = args.split()
     model = parts[0]
-    provider = DEFAULT_PROVIDER
 
+    # Validate model string
+    err = _validate_model(model)
+    if err:
+        return f"Invalid model: {err}"
+
+    provider: Optional[str] = None
     if len(parts) >= 3 and parts[1] == "--provider":
         provider = parts[2]
+
+    if not provider:
+        provider = _get_current_provider()
+        if not provider:
+            return (
+                "Error: no provider specified and none found in config.yaml.\n"
+                "Usage: /free-model <model> --provider <provider>"
+            )
 
     output = _run_set_model(["--model", model, "--provider", provider])
     return output
@@ -204,6 +256,15 @@ def _handle_free_model(raw_args: str) -> Optional[str]:
 
 def _handle_free_model_end(raw_args: str) -> Optional[str]:
     args = raw_args.strip()
+
+    # Check for cron setup failures first
+    if _cron_setup_error:
+        return (
+            "Error: revert cron was not set up during plugin load.\n"
+            f"{_cron_setup_error}\n\n"
+            "Try restarting the gateway to re-initialize the plugin."
+        )
+
     if not args:
         return (
             "Usage: /free-model-end yyyy/mm/dd HH:MM\n\n"
@@ -214,12 +275,12 @@ def _handle_free_model_end(raw_args: str) -> Optional[str]:
             "previous model at the specified time."
         )
 
-    # Parse datetime
+    # Parse datetime — accept both / and - separators
     dt: Optional[datetime] = None
-    for fmt in ("%Y/%m/%d %H:%M", "%Y/%m/%d"):
+    for fmt in ("%Y/%m/%d %H:%M", "%Y/%m/%d", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(args, fmt)
-            if fmt == "%Y/%m/%d":
+            if fmt in ("%Y/%m/%d", "%Y-%m-%d"):
                 dt = dt.replace(hour=0, minute=0)
             break
         except ValueError:
@@ -228,8 +289,9 @@ def _handle_free_model_end(raw_args: str) -> Optional[str]:
     if dt is None:
         return (
             f"Could not parse '{args}'.\n"
-            "Use format: yyyy/mm/dd HH:MM (e.g., 2026/06/01 23:00)\n"
-            "Or just: yyyy/mm/dd (defaults to 00:00)"
+            "Use format: yyyy/mm/dd HH:MM or yyyy-mm-dd HH:MM\n"
+            "  (e.g., 2026/06/01 23:00 or 2026-06-01 23:00)\n"
+            "Or just date (defaults to 00:00): 2026/06/15 or 2026-06-15"
         )
 
     if dt < datetime.now():
@@ -261,7 +323,7 @@ def _handle_free_model_end(raw_args: str) -> Optional[str]:
 
     return (
         f"Revert scheduled for {dt.strftime('%Y-%m-%d %H:%M')}.\n"
-        f"Cron job 'revert-free-model' updated and resumed. "
+        f"Cron job '{CRON_NAME}' updated and resumed. "
         f"It will run `set-model.py --revert` at the scheduled time\n"
         f"to restore the previous model."
     )

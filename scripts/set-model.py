@@ -6,13 +6,13 @@ Set the active model across all Hermes surfaces:
 
 Usage:
   # Switch everything to a free model
-  python3 ~/.hermes/scripts/set-model.py --model arcee-ai/trinity-mini:free --provider openrouter
+  python3 set-model.py --model arcee-ai/trinity-mini:free --provider openrouter
 
-  # Revert to the previous snapshot
-  python3 ~/.hermes/scripts/set-model.py --revert
+  # Revert to the most recent snapshot
+  python3 set-model.py --revert
 
   # Preview changes without writing
-  python3 ~/.hermes/scripts/set-model.py --model ... --dry-run
+  python3 set-model.py --model ... --dry-run
 """
 
 import argparse
@@ -21,14 +21,22 @@ import os
 import shutil
 import sys
 import yaml
-from datetime import datetime
-from copy import deepcopy
+from datetime import datetime, timedelta
 
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 CONFIG_PATH = os.path.join(HERMES_HOME, "config.yaml")
 JOBS_PATH = os.path.join(HERMES_HOME, "cron", "jobs.json")
 SNAPSHOT_DIR = os.path.join(HERMES_HOME, "model-snapshots")
+MAX_SNAPSHOT_AGE_DAYS = 30
+REVERT_STACK_SIZE = 5
 
+
+# ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
 
 def load_yaml(path):
     with open(path) as f:
@@ -50,43 +58,134 @@ def write_json(path, data):
         json.dump(data, f, indent=2, default=str)
 
 
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_model(model: str) -> str:
+    """Basic sanity check on model string. Returns error or empty string."""
+    if " " in model:
+        return "Model name must not contain spaces."
+    if ":" not in model and "/" in model:
+        # Likely fine — org/model without suffix
+        return ""
+    if "/" not in model:
+        return "Model name should include provider prefix (e.g., org/model)."
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Snapshot management
+# ---------------------------------------------------------------------------
+
 def backup_file(path):
-    """Create a snapshot copy of a file."""
+    """Create a dated snapshot copy of a file. Returns the snapshot path."""
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
     name = os.path.basename(path)
-    bak = os.path.join(SNAPSHOT_DIR, f"{name}.{ts}")
-    shutil.copy2(path, bak)
-    return bak
+    dst = os.path.join(SNAPSHOT_DIR, f"{name}.{ts}")
+    shutil.copy2(path, dst)
+    return dst
 
 
-def save_revert_snapshot(config_bak, jobs_bak):
-    """Save revert pointers so --revert knows what to restore.
+def _prune_old_snapshots():
+    """Remove snapshots older than MAX_SNAPSHOT_AGE_DAYS."""
+    if not os.path.isdir(SNAPSHOT_DIR):
+        return
+    cutoff = datetime.now() - timedelta(days=MAX_SNAPSHOT_AGE_DAYS)
+    for fn in os.listdir(SNAPSHOT_DIR):
+        if fn == "revert-manifest.json":
+            continue
+        fp = os.path.join(SNAPSHOT_DIR, fn)
+        try:
+            mtime = os.path.getmtime(fp)
+            if datetime.fromtimestamp(mtime) < cutoff:
+                os.remove(fp)
+        except OSError:
+            pass
 
-    Files are keyed by relative path from HERMES_HOME so
-    shutil.copy2(snapshot, os.path.join(HERMES_HOME, key)) resolves correctly.
+
+def load_revert_stack() -> list[dict]:
+    """Load the ordered revert stack. Oldest entry first."""
+    manifest_path = os.path.join(SNAPSHOT_DIR, "revert-manifest.json")
+    if not os.path.exists(manifest_path):
+        return []
+    with open(manifest_path) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "stack" in data:
+        return data["stack"]
+    # Legacy format — single snapshot entry
+    if isinstance(data, dict) and "files" in data:
+        return [{"files": data["files"]}]
+    return []
+
+
+def _save_revert_stack(stack: list[dict]):
+    """Persist the revert stack."""
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    manifest_path = os.path.join(SNAPSHOT_DIR, "revert-manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump({"stack": stack}, f, indent=2)
+
+
+def push_revert_entry(config_bak: str, jobs_bak: str):
+    """Push a new snapshot pair onto the revert stack and prune old ones.
+
+    Maintains REVERT_STACK_SIZE entries so you can chain reverts.
     """
-    manifest = {
+    stack = load_revert_stack()
+    entry = {
         "created_at": datetime.now().isoformat(),
         "files": {
             os.path.relpath(CONFIG_PATH, HERMES_HOME): config_bak,
             os.path.relpath(JOBS_PATH, HERMES_HOME): jobs_bak,
         },
     }
-    manifest_path = os.path.join(SNAPSHOT_DIR, "revert-manifest.json")
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-    return manifest_path
+    stack.append(entry)
+    # Keep only the most recent N entries
+    if len(stack) > REVERT_STACK_SIZE:
+        # Remove snapshots of the dropped entry from disk
+        for stale in stack[:-REVERT_STACK_SIZE]:
+            _remove_snapshot_files(stale)
+        stack = stack[-REVERT_STACK_SIZE:]
+    _save_revert_stack(stack)
+    _prune_old_snapshots()
 
 
-def load_revert_snapshot():
-    manifest_path = os.path.join(SNAPSHOT_DIR, "revert-manifest.json")
-    if not os.path.exists(manifest_path):
-        print("ERROR: No revert snapshot found. Run with --model first.")
-        sys.exit(1)
-    with open(manifest_path) as f:
-        return json.load(f)
+def _remove_snapshot_files(entry: dict):
+    """Delete snapshot files referenced by a manifest entry from disk."""
+    for snapshot in (entry.get("files") or {}).values():
+        if os.path.exists(snapshot):
+            try:
+                os.remove(snapshot)
+            except OSError:
+                pass
 
+
+def pop_revert_entry() -> dict | None:
+    """Pop the most recent revert entry. Returns entry or None if empty."""
+    stack = load_revert_stack()
+    if not stack:
+        return None
+    entry = stack.pop()
+    if stack:
+        _save_revert_stack(stack)
+    else:
+        mf = os.path.join(SNAPSHOT_DIR, "revert-manifest.json")
+        try:
+            os.remove(mf)
+        except OSError:
+            pass
+    return entry
+
+
+def revert_entry_count() -> int:
+    return len(load_revert_stack())
+
+
+# ---------------------------------------------------------------------------
+# Config updaters
+# ---------------------------------------------------------------------------
 
 def update_config_yaml(model, provider, base_url, dry_run=False):
     """Update model.default and delegation.model in config.yaml."""
@@ -139,14 +238,12 @@ def update_cron_jobs(model, provider, base_url, dry_run=False):
     changed = []
 
     for job in jobs:
-        # Skip no_agent jobs — they don't use LLMs
         if job.get("no_agent"):
             continue
 
         old_model = job.get("model")
         old_prov = job.get("provider")
 
-        # Always set model (even if already set, to ensure consistency)
         if old_model != model:
             job["model"] = model
             changed.append(f"  cron/{job.get('name', job['id'])}.model: {old_model or '(inherit)'} → {model}")
@@ -164,8 +261,18 @@ def update_cron_jobs(model, provider, base_url, dry_run=False):
     return changed
 
 
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
 def do_switch(model, provider, base_url, skip_config, skip_cron, dry_run):
-    """Switch everything to the given model."""
+    """Switch everything to the given model, with rollback on failure."""
+    # Validate first
+    err = validate_model(model)
+    if err:
+        print(f"ERROR: {err}")
+        sys.exit(1)
+
     print(f"[hermes set-model] Switching to: {model}")
     if provider:
         print(f"  provider: {provider}")
@@ -181,14 +288,28 @@ def do_switch(model, provider, base_url, skip_config, skip_cron, dry_run):
 
     changes = []
 
-    if not skip_config:
-        changes.extend(update_config_yaml(model, provider, base_url, dry_run))
+    try:
+        if not skip_config:
+            changes.extend(update_config_yaml(model, provider, base_url, dry_run))
 
-    if not skip_cron:
-        changes.extend(update_cron_jobs(model, provider, base_url, dry_run))
+        if not skip_cron:
+            changes.extend(update_cron_jobs(model, provider, base_url, dry_run))
+    except Exception as exc:
+        # Rollback: restore from backups
+        print(f"ERROR during write: {exc}")
+        print("Rolling back...")
+        shutil.copy2(config_bak, CONFIG_PATH)
+        shutil.copy2(jobs_bak, JOBS_PATH)
+        os.remove(config_bak)
+        os.remove(jobs_bak)
+        print("Rollback complete. No changes written.")
+        sys.exit(1)
 
     if not changes:
         print("No changes needed — everything already matches.")
+        # Clean up unused backups
+        os.remove(config_bak)
+        os.remove(jobs_bak)
         return
 
     print("Changes:")
@@ -196,20 +317,20 @@ def do_switch(model, provider, base_url, skip_config, skip_cron, dry_run):
         print(c)
 
     if not dry_run:
-        save_revert_snapshot(config_bak, jobs_bak)
-        print(f"\nSnapshots saved to: {SNAPSHOT_DIR}/")
-        print(f"  config.yaml → {config_bak}")
-        print(f"  jobs.json → {jobs_bak}")
-        print("\nRevert with: python3 ~/.hermes/scripts/set-model.py --revert")
+        push_revert_entry(config_bak, jobs_bak)
+        depth = revert_entry_count()
+        print(f"\nSnapshot saved — you can revert with --revert")
+        if depth > 1:
+            print(f"  ({depth} previous snapshots available for chained revert)")
+        print(f"\nRevert with: {os.path.abspath(__file__)} --revert")
         print()
         print("To schedule automatic revert (e.g. daily at 23:00):")
         print(f'  hermes cron create "0 23 * * *" \\')
         print(f'    --name "revert-free-model" \\')
-        print(f'    --prompt "Run: python3 {os.path.abspath(__file__)} --revert" \\')
+        print(f'    --prompt "Run: {os.path.abspath(__file__)} --revert" \\')
         print(f'    --deliver local')
     else:
         print("\n(DRY RUN — reverted backups)")
-        # Restore backups since dry run
         shutil.copy2(config_bak, CONFIG_PATH)
         shutil.copy2(jobs_bak, JOBS_PATH)
         os.remove(config_bak)
@@ -217,11 +338,18 @@ def do_switch(model, provider, base_url, skip_config, skip_cron, dry_run):
 
 
 def do_revert(dry_run):
-    """Restore the most recent snapshot."""
-    manifest = load_revert_snapshot()
-    files = manifest["files"]
+    """Restore the most recent snapshot from the stack."""
+    entry = pop_revert_entry()
+    if not entry:
+        print("ERROR: No revert snapshots found. Run with --model first.")
+        sys.exit(1)
 
-    print(f"[hermes set-model] Reverting to snapshot from {manifest['created_at']}")
+    files = entry["files"]
+    remaining = revert_entry_count()
+
+    print(f"[hermes set-model] Reverting to snapshot from {entry['created_at']}")
+    if remaining > 0:
+        print(f"  ({remaining} earlier snapshots still available for further revert)")
     print()
 
     restored = []
@@ -232,17 +360,24 @@ def do_revert(dry_run):
         target_path = os.path.join(HERMES_HOME, target) if not os.path.isabs(target) else target
         if not dry_run:
             shutil.copy2(snapshot, target_path)
+            os.remove(snapshot)
         restored.append(f"  {target} → restored from {snapshot}")
 
     for r in restored:
         print(r)
 
     if not dry_run:
-        os.remove(os.path.join(SNAPSHOT_DIR, "revert-manifest.json"))
-        print("\nRevert complete. Snapshot manifest removed.")
+        if remaining == 0:
+            print("\nRevert complete. No more snapshots to revert to.")
+        else:
+            print(f"\nRevert complete. {remaining} earlier snapshot(s) remain — run --revert again to go farther back.")
     else:
         print("\n(DRY RUN — no changes written)")
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
