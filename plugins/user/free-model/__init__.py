@@ -39,7 +39,7 @@ def register(ctx) -> None:
         "free-model",
         handler=_handle_free_model,
         description="Switch all Hermes surfaces to a free model",
-        args_hint="<model> [--provider <name>]",
+        args_hint="<model> [--provider <name>] [--gateway-only]",
     )
     ctx.register_command(
         "free-model-end",
@@ -220,12 +220,14 @@ def _handle_free_model(raw_args: str) -> Optional[str]:
     args = raw_args.strip()
     if not args:
         return (
-            "Usage: /free-model <model> [--provider <name>]\n\n"
+            "Usage: /free-model <model> [--provider <name>] [--gateway-only]\n\n"
             "Examples:\n"
             "  /free-model stepfun/step-3.7-flash:free\n"
             "  /free-model deepseek/deepseek-v4-flash:free --provider deepseek\n"
+            "  /free-model stepfun/step-3.7-flash:free --gateway-only\n"
             "  /free-model arcee-ai/trinity-mini:free --provider openrouter\n\n"
             "Omitting --provider uses your currently configured default provider.\n"
+            "Use --gateway-only to skip delegation model and cron jobs.\n"
             "Switches config.yaml (model.default + delegation.model)\n"
             "and all LLM-driven cron jobs to the given model/provider."
         )
@@ -238,9 +240,21 @@ def _handle_free_model(raw_args: str) -> Optional[str]:
     if err:
         return f"Invalid model: {err}"
 
+    # Parse optional flags from remaining args
+    flags = parts[1:]
     provider: Optional[str] = None
-    if len(parts) >= 3 and parts[1] == "--provider":
-        provider = parts[2]
+    gateway_only = False
+
+    i = 0
+    while i < len(flags):
+        if flags[i] == "--provider" and i + 1 < len(flags):
+            provider = flags[i + 1]
+            i += 2
+        elif flags[i] == "--gateway-only":
+            gateway_only = True
+            i += 1
+        else:
+            i += 1
 
     if not provider:
         provider = _get_current_provider()
@@ -250,7 +264,11 @@ def _handle_free_model(raw_args: str) -> Optional[str]:
                 "Usage: /free-model <model> --provider <provider>"
             )
 
-    output = _run_set_model(["--model", model, "--provider", provider])
+    set_model_args = ["--model", model, "--provider", provider]
+    if gateway_only:
+        set_model_args.extend(["--skip-delegation", "--skip-cron"])
+
+    output = _run_set_model(set_model_args)
     return output
 
 

@@ -30,6 +30,36 @@ When `--provider` is omitted, the plugin uses whatever provider is configured in
 configured provider can't serve the model (e.g., a Nous model when your default
 provider is OpenRouter).
 
+### Targeting specific surfaces
+
+By default, the switch affects three surfaces: gateway config (`model.default`),
+delegation config (`delegation.model`), and all LLM-driven cron jobs. Use flags
+to restrict what changes:
+
+```
+# Only change the gateway session default — leave delegation + cron alone
+/free-model stepfun/step-3.7-flash:free --gateway-only
+/free-model arcee-ai/trinity-mini:free --provider openrouter --gateway-only
+```
+
+`--gateway-only` is shorthand for `--skip-delegation --skip-cron`. You can also
+pass the individual flags via the `set-model.py` CLI directly:
+
+```bash
+python3 set-model.py --model stepfun/step-3.7-flash:free --provider nous --skip-delegation --skip-cron
+python3 set-model.py --model stepfun/step-3.7-flash:free --provider nous --skip-cron
+python3 set-model.py --model stepfun/step-3.7-flash:free --provider nous --skip-delegation
+```
+
+What each switch affects:
+
+| Surface | `model.default` | `delegation.model` | cron jobs |
+|---------|:-:|:-:|:-:|
+| Default (no flags) | ✓ | ✓ | ✓ |
+| `--gateway-only` | ✓ | ✗ | ✗ |
+| `--skip-cron` | ✓ | ✓ | ✗ |
+| `--skip-delegation` | ✓ | ✗ | ✓ |
+
 This switches:
 - `model.default` and `delegation.model` in config.yaml
 - All LLM-driven cron jobs (skips no_agent jobs)

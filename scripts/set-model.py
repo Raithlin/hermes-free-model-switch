@@ -187,7 +187,7 @@ def revert_entry_count() -> int:
 # Config updaters
 # ---------------------------------------------------------------------------
 
-def update_config_yaml(model, provider, base_url, dry_run=False):
+def update_config_yaml(model, provider, base_url, dry_run=False, skip_delegation=False):
     """Update model.default and delegation.model in config.yaml."""
     config = load_yaml(CONFIG_PATH)
     changed = []
@@ -212,14 +212,14 @@ def update_config_yaml(model, provider, base_url, dry_run=False):
             config.setdefault("model", {})["base_url"] = base_url
             changed.append(f"  model.base_url: {old_url or '(unset)'} → {base_url}")
 
-    # --- delegation.model ---
-    old_del_model = config.get("delegation", {}).get("model")
-    if old_del_model != model:
-        config.setdefault("delegation", {})["model"] = model
-        changed.append(f"  delegation.model: {old_del_model or '(unset)'} → {model}")
+    # --- delegation (skipped if --skip-delegation or --gateway-only) ---
+    if not skip_delegation:
+        old_del_model = config.get("delegation", {}).get("model")
+        if old_del_model != model:
+            config.setdefault("delegation", {})["model"] = model
+            changed.append(f"  delegation.model: {old_del_model or '(unset)'} → {model}")
 
-    # --- delegation.provider ---
-    if provider:
+    if provider and not skip_delegation:
         old_del_prov = config.get("delegation", {}).get("provider")
         if old_del_prov != provider:
             config.setdefault("delegation", {})["provider"] = provider
@@ -265,7 +265,7 @@ def update_cron_jobs(model, provider, base_url, dry_run=False):
 # Actions
 # ---------------------------------------------------------------------------
 
-def do_switch(model, provider, base_url, skip_config, skip_cron, dry_run):
+def do_switch(model, provider, base_url, skip_config, skip_delegation, skip_cron, dry_run):
     """Switch everything to the given model, with rollback on failure."""
     # Validate first
     err = validate_model(model)
@@ -278,6 +278,14 @@ def do_switch(model, provider, base_url, skip_config, skip_cron, dry_run):
         print(f"  provider: {provider}")
     if base_url:
         print(f"  base_url: {base_url}")
+    scopes = []
+    if not skip_config:
+        scopes.append("gateway")
+    if not skip_delegation:
+        scopes.append("delegation")
+    if not skip_cron:
+        scopes.append("cron")
+    print(f"  scope: {', '.join(scopes)}")
     if dry_run:
         print("  DRY RUN — no changes written")
     print()
@@ -290,7 +298,7 @@ def do_switch(model, provider, base_url, skip_config, skip_cron, dry_run):
 
     try:
         if not skip_config:
-            changes.extend(update_config_yaml(model, provider, base_url, dry_run))
+            changes.extend(update_config_yaml(model, provider, base_url, dry_run, skip_delegation=skip_delegation))
 
         if not skip_cron:
             changes.extend(update_cron_jobs(model, provider, base_url, dry_run))
@@ -387,7 +395,9 @@ def main():
     parser.add_argument("--provider", help="Provider (e.g. openrouter, deepseek)")
     parser.add_argument("--base-url", help="Base URL override")
     parser.add_argument("--skip-config", action="store_true", help="Don't update config.yaml")
+    parser.add_argument("--skip-delegation", action="store_true", help="Don't update delegation.model")
     parser.add_argument("--skip-cron", action="store_true", help="Don't update cron jobs")
+    parser.add_argument("--gateway-only", action="store_true", help="Shorthand: skip delegation + cron, only set gateway config")
     parser.add_argument("--revert", action="store_true", help="Revert to last snapshot")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes only")
 
@@ -402,8 +412,12 @@ def main():
         print("\nERROR: --model is required (or use --revert)")
         sys.exit(1)
 
+    # --gateway-only is shorthand for --skip-delegation --skip-cron
+    skip_delegation = args.skip_delegation or args.gateway_only
+    skip_cron = args.skip_cron or args.gateway_only
+
     do_switch(args.model, args.provider, args.base_url,
-              args.skip_config, args.skip_cron, args.dry_run)
+              args.skip_config, skip_delegation, skip_cron, args.dry_run)
 
 
 if __name__ == "__main__":
