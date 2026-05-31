@@ -30,6 +30,7 @@ WIZARD_STATE_PATH = os.path.join(SNAPSHOT_DIR, "wizard-state.json")
 # Populated by _ensure_revert_cron() at registration time.
 _revert_cron_id: Optional[str] = None
 _cron_setup_error: Optional[str] = None
+_plugin_ctx: Optional[object] = None  # set by register(), used for dispatch_tool
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,8 @@ _cron_setup_error: Optional[str] = None
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
+    global _plugin_ctx
+    _plugin_ctx = ctx
     ctx.register_command(
         "free-model",
         handler=_handle_free_model,
