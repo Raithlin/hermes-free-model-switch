@@ -107,4 +107,4 @@ If you test on macOS or Windows, please report issues.
 
 ## License
 
-MIT
+[MIT](LICENSE)
